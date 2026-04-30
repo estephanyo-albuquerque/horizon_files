@@ -139,6 +139,23 @@ if s_ok and d_ok and m_ok and pode_forjar:
                 df_s['Site'] = df_s['Turbine'].map(lambda x: st.session_state.task_map.get(x, {}).get('Site'))
                 zip_file.writestr("summary_final.csv", df_s.to_csv(index=False))
 
+            # 1. Summary (Filtrado)
+            df_s = load_csv_robust(f_sum)
+            if df_s is not None:
+                df_s = df_s[df_s['Turbine'].isin(valid_set)]
+                df_s['Horizon Task ID'] = df_s['Turbine'].map(lambda x: st.session_state.task_map.get(x, {}).get('Horizon Task ID'))
+                df_s['Site'] = df_s['Turbine'].map(lambda x: st.session_state.task_map.get(x, {}).get('Site'))
+
+            # ✅ CORREÇÃO: converter coluna de data para mm/dd/yyyy
+                date_col = next((c for c in df_s.columns if 'date' in c.lower() or 'data' in c.lower()),
+                    None
+                )
+                if date_col:
+                    df_s[date_col] = pd.to_datetime(
+                    df_s[date_col], dayfirst=True, errors='coerce').dt.strftime('%m/%d/%Y')
+
+                zip_file.writestr("summary_final.csv", df_s.to_csv(index=False))
+
             # 2. Details (Filtrado)
             df_d = load_csv_robust(f_det)
             valid_photos = set()
