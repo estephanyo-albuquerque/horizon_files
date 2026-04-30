@@ -120,13 +120,12 @@ if h_ok and s_ok:
                 st.session_state['turbinas_removidas'] = remover
                 st.rerun()
 
-            removidas = st.session_state.get('turbinas_removidas', None)
-            if removidas is not None:
-                turbinas_arthwind -= set(removidas)
-                if extras - set(removidas):
-                    st.error("❌ Ainda há turbinas extras não removidas. O pacote não pode ser gerado.")
-                else:
-                    st.success(f"✅ {len(removidas)} turbina(s) extra(s) removida(s) do pacote.")
+            removidas = st.session_state.get('turbinas_removidas') or []
+            turbinas_arthwind -= set(removidas)
+            if extras - set(removidas):
+                st.error("❌ Ainda há turbinas extras não removidas. O pacote não pode ser gerado.")
+            else:
+                st.success(f"✅ {len(removidas)} turbina(s) extra(s) removida(s) do pacote.")
 
         # --- CASO 2: turbinas faltando no Arthwind ---
         if faltantes:
@@ -146,9 +145,8 @@ if h_ok and s_ok:
         if not faltantes and not extras:
             st.success("✅ Dados completos para as turbinas solicitadas pela Horizon.")
             pode_forjar = True
-        elif not faltantes and st.session_state.get('turbinas_removidas') is not None:
-            if not (extras - set(st.session_state.get('turbinas_removidas', []))):
-                pode_forjar = True
+        elif not faltantes and not (extras - set(st.session_state.get('turbinas_removidas') or [])):
+            pode_forjar = True
 
     st.markdown('</div>', unsafe_allow_html=True)
 
