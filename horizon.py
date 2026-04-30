@@ -300,15 +300,6 @@ if s_ok and d_ok and m_ok and pode_forjar:
             valid_set_chk = set(st.session_state.task_map.keys()) - set(st.session_state.get('turbinas_removidas') or [])
             df_chk_d = df_chk_d[df_chk_d[idc].isin(valid_set_chk)]
 
-            # Horizon Task ID vazio
-            if 'Horizon Task ID' in df_chk_d.columns:
-                vazios = df_chk_d['Horizon Task ID'].isna().sum() + (df_chk_d['Horizon Task ID'] == '').sum()
-                if vazios > 0:
-                    st.error(f"❌ {vazios} linha(s) sem Horizon Task ID")
-                    erros_criticos.append(f"Details: {vazios} linha(s) sem Horizon Task ID")
-                else:
-                    st.success("✅ Horizon Task ID preenchido")
-
             # URL e Path
             path_col = next((c for c in df_chk_d.columns if any(x in c.lower() for x in ['path', 'file', 'image'])), None)
             url_col  = next((c for c in df_chk_d.columns if 'url' in c.lower()), None)
@@ -354,7 +345,8 @@ if s_ok and d_ok and m_ok and pode_forjar:
 
     # ---- DAMAGES ----
     with st.expander("📄 Damages", expanded=True):
-        coord_pattern = re.compile(r'^\[(\[\d+,\d+\],?)+\]$')
+        # Aceita: [x,y],[x,y],... ou [[x,y],[x,y],...] ou [x,y] isolado
+        coord_pattern = re.compile(r'^(\[\d+,\s*\d+\],?\s*)+$')
         for f_dam in f_dam_list:
             df_chk_m = load_csv_robust(f_dam, is_damage=True)
             if df_chk_m is not None:
@@ -396,6 +388,8 @@ if s_ok and d_ok and m_ok and pode_forjar:
 if s_ok and d_ok and m_ok and pode_forjar and not erros_criticos:
     if st.button("GERAR PACOTE FINAL"):
         zip_buffer = io.BytesIO()
+        erros_pos = []
+
         with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED) as zip_file:
             q = '"'
             removidas_set = set(st.session_state.get('turbinas_removidas') or [])
@@ -404,58 +398,139 @@ if s_ok and d_ok and m_ok and pode_forjar and not erros_criticos:
             # 1. Summary Final — base Horizon + dados do ATW via join por Turbine
             df_hor = load_horizon_base(f_horizon)
             df_atw = load_csv_robust(f_sum)
+            df_summary_final = None
             if df_hor is not None and df_atw is not None:
-                # Filtra base Horizon pelas turbinas válidas
                 df_hor = df_hor[df_hor['Turbine'].isin(valid_set)].copy()
 
-                # Prepara lookup do ATW: Turbine → Inspection Date + Inspection Type
                 date_col_atw = next((c for c in df_atw.columns if 'date' in c.lower() or 'data' in c.lower()), None)
                 type_col_atw = next((c for c in df_atw.columns if 'inspection type' in c.lower()), None)
-
                 atw_lookup = df_atw.drop_duplicates('Turbine').set_index('Turbine')
 
-                # Injeta Inspection Date (com conversão para mm/dd/yyyy)
                 if date_col_atw:
                     df_hor['Inspection Date'] = df_hor['Turbine'].map(
-                        lambda t: atw_lookup.loc[t, date_col_atw]
-                        if t in atw_lookup.index else ''
+                        lambda t: atw_lookup.loc[t, date_col_atw] if t in atw_lookup.index else ''
                     )
                     df_hor['Inspection Date'] = pd.to_datetime(
                         df_hor['Inspection Date'], dayfirst=True, errors='coerce'
                     ).dt.strftime('%m/%d/%Y')
 
-                # Injeta Inspection Type
                 if type_col_atw:
                     df_hor['Inspection Type'] = df_hor['Turbine'].map(
-                        lambda t: atw_lookup.loc[t, type_col_atw]
-                        if t in atw_lookup.index else ''
+                        lambda t: atw_lookup.loc[t, type_col_atw] if t in atw_lookup.index else ''
                     )
 
+                df_summary_final = df_hor
                 zip_file.writestr("summary_final.csv", df_hor.to_csv(index=False))
 
             # 2. Details (Filtrado)
             df_d = load_csv_robust(f_det)
+            df_details_final = None
             valid_photos = set()
             if df_d is not None:
                 idc = 'ID' if 'ID' in df_d.columns else df_d.columns[0]
-                df_d = df_d[df_d[idc].isin(valid_set)]
+                df_d = df_d[df_d[idc].isin(valid_set)].copy()
 
                 path_col = next((c for c in df_d.columns if any(x in c.lower() for x in ['path', 'file', 'image'])), df_d.columns[-1])
                 valid_photos = {clean_filename(n) for n in df_d[path_col].unique() if n}
 
                 df_d['Horizon Task ID'] = df_d[idc].map(lambda x: st.session_state.task_map.get(x, {}).get('Horizon Task ID'))
+                df_details_final = df_d
                 zip_file.writestr("details_final.csv", df_d.to_csv(index=False, sep=';'))
 
             # 3. Damages (Filtrado por Vínculo de Imagem)
+            damages_finais = []
             for f_dam in f_dam_list:
                 df_m = load_csv_robust(f_dam, is_damage=True)
                 if df_m is not None:
                     df_m = df_m[df_m['Photo File Name'].apply(clean_filename).isin(valid_photos)]
                     if not df_m.empty:
+                        damages_finais.append((f_dam.name, df_m))
                         csv_lines = [",".join(df_m.columns)]
                         for _, row in df_m.iterrows():
                             line_vals = [f"{q}{str(row[c]).strip(q)}{q}" if c == 'Coordinates' else str(row[c]).strip(q) for c in df_m.columns]
                             csv_lines.append(",".join(line_vals))
                         zip_file.writestr(f_dam.name, "\n".join(csv_lines))
 
-        st.download_button("BAIXAR PACOTE (.ZIP)", data=zip_buffer.getvalue(), file_name="horizon_package.zip")
+        # --- VERIFICAÇÃO PÓS-PROCESSAMENTO ---
+        st.markdown('<div class="report-block">', unsafe_allow_html=True)
+        st.subheader("5. VERIFICAÇÃO FINAL DO PACOTE")
+
+        # -- Summary final --
+        with st.expander("📄 Summary final", expanded=True):
+            if df_summary_final is not None:
+                for campo, label in [('Horizon Task ID', 'Horizon Task ID'), ('Inspection Date', 'Inspection Date'), ('Inspection Type', 'Inspection Type')]:
+                    if campo in df_summary_final.columns:
+                        sem_valor = df_summary_final[
+                            df_summary_final[campo].isna() | (df_summary_final[campo].astype(str).str.strip() == '') | (df_summary_final[campo].astype(str).str.strip() == 'NaT')
+                        ]
+                        if not sem_valor.empty:
+                            turbinas_problema = ', '.join(sorted(sem_valor['Turbine'].astype(str).unique()))
+                            st.error(f"❌ {label} vazio em: {turbinas_problema}")
+                            erros_pos.append(f"Summary: {label} vazio em {len(sem_valor)} turbina(s)")
+                        else:
+                            st.success(f"✅ {label} OK")
+                    else:
+                        st.error(f"❌ Coluna '{campo}' não encontrada no Summary final")
+                        erros_pos.append(f"Summary: coluna '{campo}' ausente")
+
+        # -- Details final --
+        with st.expander("📄 Details final", expanded=True):
+            if df_details_final is not None:
+                # Horizon Task ID após join
+                if 'Horizon Task ID' in df_details_final.columns:
+                    sem_task = df_details_final[
+                        df_details_final['Horizon Task ID'].isna() | (df_details_final['Horizon Task ID'].astype(str).str.strip() == '')
+                    ]
+                    if not sem_task.empty:
+                        turbinas_problema = ', '.join(sorted(sem_task[idc].astype(str).unique()))
+                        st.error(f"❌ Horizon Task ID vazio após join em: {turbinas_problema}")
+                        erros_pos.append(f"Details: Horizon Task ID vazio em {len(sem_task)} linha(s)")
+                    else:
+                        st.success("✅ Horizon Task ID OK")
+
+                # Path e URL
+                path_col_chk = next((c for c in df_details_final.columns if any(x in c.lower() for x in ['path', 'file', 'image'])), None)
+                url_col_chk  = next((c for c in df_details_final.columns if 'url' in c.lower()), None)
+
+                for col, label in [(path_col_chk, 'Path'), (url_col_chk, 'URL')]:
+                    if col:
+                        vazios = df_details_final[
+                            df_details_final[col].isna() | (df_details_final[col].astype(str).str.strip() == '')
+                        ].shape[0]
+                        if vazios > 0:
+                            st.error(f"❌ {label} vazio em {vazios} linha(s)")
+                            erros_pos.append(f"Details: {label} vazio em {vazios} linha(s)")
+                        else:
+                            st.success(f"✅ {label} OK")
+
+        # -- Damages final --
+        with st.expander("📄 Damages final", expanded=True):
+            if damages_finais:
+                # Coleta todos os photo file names do Details final para cruzamento
+                path_col_det = next((c for c in df_details_final.columns if any(x in c.lower() for x in ['path', 'file', 'image'])), None) if df_details_final is not None else None
+                fotos_details = {clean_filename(n) for n in df_details_final[path_col_det].unique() if n} if path_col_det else set()
+
+                for nome_dam, df_dam in damages_finais:
+                    st.markdown(f"**{nome_dam}**")
+                    if 'Photo File Name' in df_dam.columns:
+                        fotos_dam = {clean_filename(n) for n in df_dam['Photo File Name'].unique() if n}
+                        fotos_sem_match = fotos_dam - fotos_details
+                        if fotos_sem_match:
+                            st.error(f"❌ {len(fotos_sem_match)} foto(s) no Damage sem correspondência no Details: {', '.join(sorted(fotos_sem_match))}")
+                            erros_pos.append(f"Damages ({nome_dam}): {len(fotos_sem_match)} foto(s) sem correspondência no Details")
+                        else:
+                            st.success("✅ Todas as fotos encontradas no Details")
+            else:
+                st.info("Nenhum arquivo de Damages gerado.")
+
+        # -- Resultado final --
+        st.divider()
+        if erros_pos:
+            st.error(f"🚫 Pacote gerado com {len(erros_pos)} problema(s). Corrija e gere novamente.")
+            for e in erros_pos:
+                st.markdown(f"- {e}")
+        else:
+            st.success("✅ Pacote verificado e aprovado. Pronto para download.")
+            st.download_button("⬇️ BAIXAR PACOTE (.ZIP)", data=zip_buffer.getvalue(), file_name="horizon_package.zip")
+
+        st.markdown('</div>', unsafe_allow_html=True)
