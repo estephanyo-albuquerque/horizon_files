@@ -122,6 +122,63 @@ if h_ok and s_ok:
                 st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
 
+# --- VERIFICADOR DE QUALIDADE ---
+if s_ok and pode_forjar:
+    st.markdown('<div class="report-block">', unsafe_allow_html=True)
+    st.subheader("4. VERIFICAÇÃO DE REQUISITOS")
+
+    df_check = load_csv_robust(f_sum)
+    issues = []
+    warnings_check = []
+
+    if df_check is not None:
+        # Verifica coluna de data
+        date_col = next(
+            (c for c in df_check.columns if 'date' in c.lower() or 'data' in c.lower()),
+            None
+        )
+
+        if date_col is None:
+            issues.append("❌ Coluna de data não encontrada no Summary")
+        else:
+            # Tenta detectar formato dd/mm/yyyy
+            sample = df_check[date_col].dropna().head(10)
+            br_format = sample.apply(
+                lambda x: bool(re.match(r'^\d{2}/\d{2}/\d{4}$', str(x))) and
+                          int(str(x).split('/')[0]) > 12
+            ).any()
+
+            ambiguous = sample.apply(
+                lambda x: bool(re.match(r'^\d{2}/\d{2}/\d{4}$', str(x))) and
+                          int(str(x).split('/')[0]) <= 12
+            ).any()
+
+            if br_format:
+                issues.append(f"❌ Datas em formato BR (dd/mm/yyyy) — serão convertidas automaticamente")
+            elif ambiguous:
+                warnings_check.append(f"⚠️ Datas ambíguas detectadas — verifique se estão em mm/dd/yyyy")
+            else:
+                st.success(f"✅ Formato de data OK ({date_col})")
+
+        # Verifica campos vazios críticos
+        for col in ['Turbine', 'Inspection Type', date_col or '']:
+            if col and col in df_check.columns:
+                nulls = df_check[col].isna().sum() + (df_check[col] == '').sum()
+                if nulls > 0:
+                    warnings_check.append(f"⚠️ {nulls} valor(es) vazio(s) na coluna '{col}'")
+
+        # Exibe resultado
+        for issue in issues:
+            st.error(issue)
+        for warn in warnings_check:
+            st.warning(warn)
+        if not issues and not warnings_check:
+            st.success("✅ Summary pronto para submissão")
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+
 # --- EXPORTAÇÃO COM FILTRAGEM ---
 if s_ok and d_ok and m_ok and pode_forjar:
     if st.button("GERAR PACOTE FINAL"):
