@@ -21,6 +21,10 @@ st.title("PROCESSAMENTO DE DADOS: HORIZON")
 
 if 'task_map' not in st.session_state:
     st.session_state.task_map = {}
+if 'turbinas_removidas' not in st.session_state:
+    st.session_state.turbinas_removidas = []
+if 'vinculos_confirmados' not in st.session_state:
+    st.session_state.vinculos_confirmados = {}
 
 # --- FUNÇÕES ---
 
@@ -58,24 +62,16 @@ def load_csv_robust(uploaded_file, is_damage=False):
         return None
 
 def load_horizon_base(uploaded_file):
-    """
-    Carrega o summary_base da Horizon, pulando as linhas de cabeçalho
-    de instrução (Explanation e Valid Data Options) antes dos dados reais.
-    Retorna DataFrame limpo com apenas as linhas de dados.
-    """
     if uploaded_file is None: return None
     try:
         content = uploaded_file.getvalue().decode('utf-8', errors='ignore')
         lines = [l for l in content.splitlines() if l.strip()]
         if not lines: return None
 
-        # A primeira linha é sempre o cabeçalho real (Notes, ID, Description, ...)
         header_line = lines[0]
         sep = ';' if header_line.count(';') > header_line.count(',') else ','
         header = [h.strip().replace('"', '') for h in header_line.split(sep)]
 
-        # Pula linhas de instrução: qualquer linha cujo primeiro campo
-        # contenha "DELETE THIS ROW" ou "Explanation" ou "Valid Data"
         skip_keywords = ['delete this row', 'explanation:', 'valid data options']
         data = []
         for line in lines[1:]:
@@ -87,17 +83,24 @@ def load_horizon_base(uploaded_file):
 
         df = pd.DataFrame(data, columns=header)
 
-        # Remove coluna "Notes" se existir (é só metadado do template)
         if 'Notes' in df.columns:
             df = df.drop(columns=['Notes'])
 
-        # Filtra linhas completamente vazias
         df = df[df.apply(lambda row: any(v.strip() != '' for v in row.astype(str)), axis=1)]
 
         return df
     except Exception as e:
         st.error(f"Erro ao carregar base Horizon: {e}")
         return None
+
+def deduplicate_atw(df):
+    """Remove duplicatas do ATW mantendo a primeira ocorrência por Turbine."""
+    if df is None or 'Turbine' not in df.columns:
+        return df, 0
+    total_antes = len(df)
+    df_dedup = df.drop_duplicates(subset='Turbine', keep='first').reset_index(drop=True)
+    duplicatas_removidas = total_antes - len(df_dedup)
+    return df_dedup, duplicatas_removidas
 
 # --- SIDEBAR ---
 st.sidebar.header("STATUS DOS ARQUIVOS")
@@ -141,98 +144,138 @@ with c2:
     m_ok = check_status(f_dam_list, "DAMAGES")
     st.markdown('</div>', unsafe_allow_html=True)
 
+# --- DEDUPLICAÇÃO DO ATW ---
+df_atw_dedup = None
+if s_ok:
+    df_atw_raw = load_csv_robust(f_sum)
+    if df_atw_raw is not None and 'Turbine' in df_atw_raw.columns:
+        df_atw_dedup, n_duplicatas = deduplicate_atw(df_atw_raw)
+        if n_duplicatas > 0:
+            st.warning(
+                f"⚠️ O Summary ATW continha **{n_duplicatas} linha(s) duplicada(s)** "
+                f"(mesma Turbine repetida). Foram removidas automaticamente, mantendo a primeira ocorrência de cada turbina."
+            )
+
 # --- VALIDAÇÃO ---
 pode_forjar = False
 
-if h_ok and s_ok:
+if h_ok and s_ok and df_atw_dedup is not None:
     st.markdown('<div class="report-block">', unsafe_allow_html=True)
     st.subheader("3. VALIDAÇÃO DE NOMENCLATURA")
-    df_s_val = load_csv_robust(f_sum)
-    if df_s_val is not None:
 
-        # Listas limpas e ordenadas
-        turbinas_atw = sorted([
-            t for t in df_s_val['Turbine'].unique()
-            if t and str(t).strip() != ''
-        ])
-        turbinas_hor = sorted([
-            t for t in st.session_state.task_map.keys()
-            if t and str(t).strip() != ''
-        ])
+    turbinas_atw = sorted([
+        t for t in df_atw_dedup['Turbine'].unique()
+        if t and str(t).strip() != ''
+    ])
+    turbinas_hor = sorted([
+        t for t in st.session_state.task_map.keys()
+        if t and str(t).strip() != ''
+    ])
 
-        set_atw = set(turbinas_atw)
-        set_hor = set(turbinas_hor)
-        extras    = sorted(set_atw - set_hor)   # no ATW mas não na Horizon
-        faltantes = sorted(set_hor - set_atw)   # na Horizon mas não no ATW
+    set_atw = set(turbinas_atw)
+    set_hor = set(turbinas_hor)
 
-        # --- CONTADORES ---
-        cc1, cc2, cc3 = st.columns(3)
-        cc1.metric("Turbinas na Horizon", len(turbinas_hor))
-        cc2.metric("Turbinas no Summary ATW", len(turbinas_atw))
-        delta = len(turbinas_atw) - len(turbinas_hor)
-        cc3.metric("Diferença (ATW − Horizon)", delta, delta_color="inverse")
+    # Aplica vínculos já confirmados: adiciona turbinas ATW mapeadas ao set_hor efetivo
+    vinculos = st.session_state.vinculos_confirmados  # {turbina_hor: turbina_atw}
+    set_hor_mapeado = set(vinculos.values())  # ATW já vinculadas
+    set_hor_sem_vinculo = set_hor - set(vinculos.keys())  # Horizon ainda sem vínculo
 
-        st.divider()
+    extras    = sorted(set_atw - set_hor - set_hor_mapeado)   # no ATW mas não na Horizon e não vinculadas
+    faltantes = sorted(set_hor_sem_vinculo - set_atw)          # na Horizon mas não no ATW e sem vínculo
 
-        # --- CASO 1: turbinas extras no ATW ---
-        if extras:
-            st.warning(
-                f"⚠️ {len(extras)} turbina(s) presente(s) no ATW mas **ausente(s) na Horizon**: "
-                f"{', '.join(extras)}"
+    cc1, cc2, cc3 = st.columns(3)
+    cc1.metric("Turbinas na Horizon", len(turbinas_hor))
+    cc2.metric("Turbinas no Summary ATW", len(turbinas_atw))
+    delta = len(turbinas_atw) - len(turbinas_hor)
+    cc3.metric("Diferença (ATW − Horizon)", delta, delta_color="inverse")
+
+    st.divider()
+
+    # --- CASO 1: turbinas extras no ATW ---
+    removidas = st.session_state.turbinas_removidas
+
+    if extras:
+        st.warning(
+            f"⚠️ {len(extras)} turbina(s) presente(s) no ATW mas **ausente(s) na Horizon**: "
+            f"{', '.join(extras)}"
+        )
+        remover = st.multiselect(
+            "Selecione as turbinas EXTRAS para REMOVER do pacote:",
+            options=extras,
+            default=[e for e in extras if e not in removidas],
+            key="extras_remover"
+        )
+        if st.button("CONFIRMAR REMOÇÃO"):
+            st.session_state.turbinas_removidas = list(set(removidas) | set(remover))
+            st.rerun()
+
+        removidas = st.session_state.turbinas_removidas
+        ainda_extras = [e for e in extras if e not in removidas]
+        if ainda_extras:
+            st.error(
+                f"❌ Ainda há {len(ainda_extras)} turbina(s) extra(s) sem resolução: "
+                f"{', '.join(ainda_extras)}"
             )
-            remover = st.multiselect(
-                "Selecione as turbinas EXTRAS para REMOVER do pacote:",
-                options=extras,
-                default=extras,
-                key="extras_remover"
-            )
-            if st.button("CONFIRMAR REMOÇÃO"):
-                st.session_state['turbinas_removidas'] = remover
+        else:
+            if removidas:
+                st.success(f"✅ {len([e for e in removidas if e in extras])} turbina(s) extra(s) removida(s) do pacote.")
+
+    # --- CASO 2: turbinas faltando no ATW ---
+    if faltantes:
+        st.warning(
+            f"⚠️ {len(faltantes)} turbina(s) da Horizon **ausente(s) no ATW**: "
+            f"{', '.join(faltantes)}"
+        )
+
+        # Opções disponíveis: turbinas ATW que não foram removidas e não estão já vinculadas
+        removidas_set = set(st.session_state.turbinas_removidas)
+        ja_vinculadas = set(vinculos.values())
+        opcoes_atw = sorted(set_atw - removidas_set - ja_vinculadas)
+
+        if opcoes_atw:
+            correcoes = {}
+            cv1, cv2 = st.columns(2)
+            for i, th in enumerate(faltantes):
+                with cv1 if i % 2 == 0 else cv2:
+                    # Pré-seleciona vínculo existente se já foi confirmado antes
+                    default_idx = 0
+                    sel = st.selectbox(
+                        f"Vincular '{th}' (Horizon) a:",
+                        options=opcoes_atw,
+                        index=default_idx,
+                        key=f"v_{th}"
+                    )
+                    correcoes[th] = sel
+
+            if st.button("CONFIRMAR VÍNCULOS"):
+                # Atualiza task_map: turbina ATW herda dados da turbina Horizon
+                for th, ta in correcoes.items():
+                    if th in st.session_state.task_map:
+                        st.session_state.task_map[ta] = st.session_state.task_map[th]
+                # Salva vínculos confirmados
+                st.session_state.vinculos_confirmados.update(correcoes)
                 st.rerun()
 
-            removidas = st.session_state.get('turbinas_removidas') or []
-            ainda_extras = [e for e in extras if e not in removidas]
-            if ainda_extras:
-                st.error(
-                    f"❌ Ainda há {len(ainda_extras)} turbina(s) extra(s) sem resolução: "
-                    f"{', '.join(ainda_extras)}"
-                )
-            else:
-                if removidas:
-                    st.success(f"✅ {len(removidas)} turbina(s) extra(s) removida(s) do pacote.")
+        else:
+            st.error("❌ Não há turbinas disponíveis no ATW para vincular.")
 
-        # --- CASO 2: turbinas faltando no ATW ---
-        if faltantes:
-            st.warning(
-                f"⚠️ {len(faltantes)} turbina(s) da Horizon **ausente(s) no ATW**: "
-                f"{', '.join(faltantes)}"
-            )
-            removidas = st.session_state.get('turbinas_removidas') or []
-            opcoes_atw = sorted(set_atw - set(removidas))
-            if opcoes_atw:
-                correcoes = {}
-                cv1, cv2 = st.columns(2)
-                for i, th in enumerate(faltantes):
-                    with cv1 if i % 2 == 0 else cv2:
-                        sel = st.selectbox(
-                            f"Vincular '{th}' (Horizon) a:",
-                            options=opcoes_atw,
-                            key=f"v_{th}"
-                        )
-                        correcoes[th] = sel
-                if st.button("CONFIRMAR VÍNCULOS"):
-                    for th, ta in correcoes.items():
-                        st.session_state.task_map[ta] = st.session_state.task_map[th]
-                    st.rerun()
-            else:
-                st.error("❌ Não há turbinas disponíveis no ATW para vincular.")
+    # Exibe vínculos já confirmados
+    if vinculos:
+        with st.expander(f"🔗 {len(vinculos)} vínculo(s) confirmado(s)", expanded=False):
+            for th, ta in vinculos.items():
+                st.markdown(f"- **{th}** (Horizon) → **{ta}** (ATW)")
 
-        # --- TUDO OK ---
-        removidas_final = st.session_state.get('turbinas_removidas') or []
-        ainda_extras_final = [e for e in extras if e not in removidas_final]
-        if not faltantes and not ainda_extras_final:
-            st.success("✅ Dados completos para as turbinas solicitadas pela Horizon.")
-            pode_forjar = True
+    # --- TUDO OK ---
+    removidas_final = st.session_state.turbinas_removidas
+    ainda_extras_final = [
+        e for e in (set_atw - set_hor - set(vinculos.values()))
+        if e not in removidas_final
+    ]
+    faltantes_final = sorted(set_hor - set(vinculos.keys()) - set_atw)
+
+    if not faltantes_final and not ainda_extras_final:
+        st.success("✅ Dados completos para as turbinas solicitadas pela Horizon.")
+        pode_forjar = True
 
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -252,12 +295,12 @@ if s_ok and d_ok and m_ok and pode_forjar:
 
     # ---- SUMMARY ----
     with st.expander("📄 Summary", expanded=True):
-        df_chk_s = load_csv_robust(f_sum)
+        # Usa df já deduplicado
+        df_chk_s = df_atw_dedup.copy() if df_atw_dedup is not None else None
         if df_chk_s is not None:
-            removidas_set = set(st.session_state.get('turbinas_removidas') or [])
+            removidas_set = set(st.session_state.turbinas_removidas)
             df_chk_s = df_chk_s[~df_chk_s['Turbine'].isin(removidas_set)]
 
-            # Formato de data
             date_col = next((c for c in df_chk_s.columns if 'date' in c.lower() or 'data' in c.lower()), None)
             if date_col is None:
                 st.error("❌ Coluna de data não encontrada")
@@ -279,7 +322,6 @@ if s_ok and d_ok and m_ok and pode_forjar:
                 else:
                     st.success(f"✅ Formato de data OK ({date_col})")
 
-            # Inspection Type
             if 'Inspection Type' in df_chk_s.columns:
                 invalidos = df_chk_s[~df_chk_s['Inspection Type'].isin(INSPECTION_TYPES_VALIDOS)]['Inspection Type'].unique()
                 invalidos = [v for v in invalidos if v and str(v).strip() != '']
@@ -297,10 +339,9 @@ if s_ok and d_ok and m_ok and pode_forjar:
         df_chk_d = load_csv_robust(f_det)
         if df_chk_d is not None:
             idc = 'ID' if 'ID' in df_chk_d.columns else df_chk_d.columns[0]
-            valid_set_chk = set(st.session_state.task_map.keys()) - set(st.session_state.get('turbinas_removidas') or [])
+            valid_set_chk = set(st.session_state.task_map.keys()) - set(st.session_state.turbinas_removidas)
             df_chk_d = df_chk_d[df_chk_d[idc].isin(valid_set_chk)]
 
-            # URL e Path
             path_col = next((c for c in df_chk_d.columns if any(x in c.lower() for x in ['path', 'file', 'image'])), None)
             url_col  = next((c for c in df_chk_d.columns if 'url' in c.lower()), None)
 
@@ -326,7 +367,6 @@ if s_ok and d_ok and m_ok and pode_forjar:
                 st.warning("⚠️ Coluna de URL não identificada")
                 avisos.append("Details: coluna de URL não identificada")
 
-            # Radial Distance numérico
             rad_col = next((c for c in df_chk_d.columns if 'radial' in c.lower() or 'distance' in c.lower()), None)
             if rad_col:
                 nao_numerico = df_chk_d[
@@ -345,7 +385,6 @@ if s_ok and d_ok and m_ok and pode_forjar:
 
     # ---- DAMAGES ----
     with st.expander("📄 Damages", expanded=True):
-        # Aceita: [x,y],[x,y],... ou [[x,y],[x,y],...] ou [x,y] isolado
         coord_pattern = re.compile(r'^(\[\d+,\s*\d+\],?\s*)+$')
         for f_dam in f_dam_list:
             df_chk_m = load_csv_robust(f_dam, is_damage=True)
@@ -384,7 +423,7 @@ if s_ok and d_ok and m_ok and pode_forjar:
 
     st.markdown('</div>', unsafe_allow_html=True)
 
-# --- EXPORTAÇÃO COM FILTRAGEM ---
+# --- EXPORTAÇÃO ---
 if s_ok and d_ok and m_ok and pode_forjar and not erros_criticos:
     if st.button("GERAR PACOTE FINAL"):
         zip_buffer = io.BytesIO()
@@ -392,12 +431,12 @@ if s_ok and d_ok and m_ok and pode_forjar and not erros_criticos:
 
         with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED) as zip_file:
             q = '"'
-            removidas_set = set(st.session_state.get('turbinas_removidas') or [])
+            removidas_set = set(st.session_state.turbinas_removidas)
             valid_set = set(st.session_state.task_map.keys()) - removidas_set
 
-            # 1. Summary Final — base Horizon + dados do ATW via join por Turbine
+            # 1. Summary Final
             df_hor = load_horizon_base(f_horizon)
-            df_atw = load_csv_robust(f_sum)
+            df_atw = df_atw_dedup.copy()  # já deduplicado
             df_summary_final = None
             if df_hor is not None and df_atw is not None:
                 df_hor = df_hor[df_hor['Turbine'].isin(valid_set)].copy()
@@ -437,7 +476,7 @@ if s_ok and d_ok and m_ok and pode_forjar and not erros_criticos:
                 df_details_final = df_d
                 zip_file.writestr("details_final.csv", df_d.to_csv(index=False, sep=';'))
 
-            # 3. Damages (Filtrado por Vínculo de Imagem)
+            # 3. Damages (Filtrado)
             damages_finais = []
             for f_dam in f_dam_list:
                 df_m = load_csv_robust(f_dam, is_damage=True)
@@ -455,7 +494,6 @@ if s_ok and d_ok and m_ok and pode_forjar and not erros_criticos:
         st.markdown('<div class="report-block">', unsafe_allow_html=True)
         st.subheader("5. VERIFICAÇÃO FINAL DO PACOTE")
 
-        # -- Summary final --
         with st.expander("📄 Summary final", expanded=True):
             if df_summary_final is not None:
                 for campo, label in [('Horizon Task ID', 'Horizon Task ID'), ('Inspection Date', 'Inspection Date'), ('Inspection Type', 'Inspection Type')]:
@@ -473,10 +511,8 @@ if s_ok and d_ok and m_ok and pode_forjar and not erros_criticos:
                         st.error(f"❌ Coluna '{campo}' não encontrada no Summary final")
                         erros_pos.append(f"Summary: coluna '{campo}' ausente")
 
-        # -- Details final --
         with st.expander("📄 Details final", expanded=True):
             if df_details_final is not None:
-                # Horizon Task ID após join
                 if 'Horizon Task ID' in df_details_final.columns:
                     sem_task = df_details_final[
                         df_details_final['Horizon Task ID'].isna() | (df_details_final['Horizon Task ID'].astype(str).str.strip() == '')
@@ -488,7 +524,6 @@ if s_ok and d_ok and m_ok and pode_forjar and not erros_criticos:
                     else:
                         st.success("✅ Horizon Task ID OK")
 
-                # Path e URL
                 path_col_chk = next((c for c in df_details_final.columns if any(x in c.lower() for x in ['path', 'file', 'image'])), None)
                 url_col_chk  = next((c for c in df_details_final.columns if 'url' in c.lower()), None)
 
@@ -503,10 +538,8 @@ if s_ok and d_ok and m_ok and pode_forjar and not erros_criticos:
                         else:
                             st.success(f"✅ {label} OK")
 
-        # -- Damages final --
         with st.expander("📄 Damages final", expanded=True):
             if damages_finais:
-                # Coleta todos os photo file names do Details final para cruzamento
                 path_col_det = next((c for c in df_details_final.columns if any(x in c.lower() for x in ['path', 'file', 'image'])), None) if df_details_final is not None else None
                 fotos_details = {clean_filename(n) for n in df_details_final[path_col_det].unique() if n} if path_col_det else set()
 
@@ -523,7 +556,6 @@ if s_ok and d_ok and m_ok and pode_forjar and not erros_criticos:
             else:
                 st.info("Nenhum arquivo de Damages gerado.")
 
-        # -- Resultado final --
         st.divider()
         if erros_pos:
             st.error(f"🚫 Pacote gerado com {len(erros_pos)} problema(s). Corrija e gere novamente.")
