@@ -445,9 +445,17 @@ if s_ok and d_ok and m_ok and pode_forjar and not erros_criticos:
                 type_col_atw = next((c for c in df_atw.columns if 'inspection type' in c.lower()), None)
                 atw_lookup = df_atw.drop_duplicates('Turbine').set_index('Turbine')
 
+                # Mapa Horizon → ATW: para turbinas vinculadas usa o nome ATW; demais usam o próprio nome
+                vinculos_hor_to_atw = st.session_state.vinculos_confirmados  # {nome_hor: nome_atw}
+
+                def resolve_atw_name(t_hor):
+                    """Retorna o nome ATW correspondente a uma turbina Horizon."""
+                    return vinculos_hor_to_atw.get(t_hor, t_hor)
+
                 if date_col_atw:
                     df_hor['Inspection Date'] = df_hor['Turbine'].map(
-                        lambda t: atw_lookup.loc[t, date_col_atw] if t in atw_lookup.index else ''
+                        lambda t: atw_lookup.loc[resolve_atw_name(t), date_col_atw]
+                        if resolve_atw_name(t) in atw_lookup.index else ''
                     )
                     df_hor['Inspection Date'] = pd.to_datetime(
                         df_hor['Inspection Date'], dayfirst=True, errors='coerce'
@@ -455,7 +463,8 @@ if s_ok and d_ok and m_ok and pode_forjar and not erros_criticos:
 
                 if type_col_atw:
                     df_hor['Inspection Type'] = df_hor['Turbine'].map(
-                        lambda t: atw_lookup.loc[t, type_col_atw] if t in atw_lookup.index else ''
+                        lambda t: atw_lookup.loc[resolve_atw_name(t), type_col_atw]
+                        if resolve_atw_name(t) in atw_lookup.index else ''
                     )
 
                 df_summary_final = df_hor
