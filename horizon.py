@@ -26,6 +26,8 @@ if 'turbinas_removidas' not in st.session_state:
     st.session_state.turbinas_removidas = []
 if 'vinculos_confirmados' not in st.session_state:
     st.session_state.vinculos_confirmados = {}
+if 'turbinas_horizon_originais' not in st.session_state:
+    st.session_state.turbinas_horizon_originais = []
 
 # --- FUNÇÕES ---
 
@@ -156,6 +158,10 @@ with c1:
                     .set_index('Turbine')[['Horizon Task ID', 'Site']]
                     .to_dict('index')
                 )
+                # Salva turbinas originais da Horizon (sem chaves ATW dos vínculos)
+                st.session_state.turbinas_horizon_originais = sorted(
+                    df_hor_base['Turbine'].dropna().unique().tolist()
+                )
                 # Reaplicar vínculos confirmados após qualquer rerun
                 # Sem isso, as chaves ATW somem do task_map e os damages TAC ficam de fora
                 for th, ta in st.session_state.vinculos_confirmados.items():
@@ -198,8 +204,9 @@ if h_ok and s_ok and df_atw_dedup is not None:
         t for t in df_atw_dedup['Turbine'].unique()
         if t and str(t).strip() != ''
     ])
+    # Usa turbinas originais da Horizon (sem chaves ATW adicionadas pelos vínculos)
     turbinas_hor = sorted([
-        t for t in st.session_state.task_map.keys()
+        t for t in (st.session_state.turbinas_horizon_originais or st.session_state.task_map.keys())
         if t and str(t).strip() != ''
     ])
 
@@ -585,6 +592,15 @@ if s_ok and d_ok and m_ok and pode_forjar and not erros_criticos:
 
         with st.expander("📄 Details final", expanded=True):
             if df_details_final is not None:
+                # Contagens do Details processado
+                idc_det = 'ID' if 'ID' in df_details_final.columns else df_details_final.columns[0]
+                turbinas_det = df_details_final[idc_det].nunique()
+                fotos_det = len(df_details_final)
+                dc1, dc2 = st.columns(2)
+                dc1.metric("Turbinas no Details", turbinas_det)
+                dc2.metric("Fotos no Details", fotos_det)
+                st.divider()
+
                 if 'Horizon Task ID' in df_details_final.columns:
                     sem_task = df_details_final[
                         df_details_final['Horizon Task ID'].isna() | (df_details_final['Horizon Task ID'].astype(str).str.strip() == '')
@@ -611,20 +627,38 @@ if s_ok and d_ok and m_ok and pode_forjar and not erros_criticos:
                             st.success(f"✅ {label} OK")
 
         with st.expander("📄 Damages final", expanded=True):
+            # Contagens gerais de damages
+            total_arq_submetidos = len(f_dam_list)
+            total_arq_processados = len(damages_finais)
+            total_danos_processados = sum(len(df_dam) for _, df_dam in damages_finais)
+            mc1, mc2, mc3 = st.columns(3)
+            mc1.metric("Arquivos submetidos", total_arq_submetidos)
+            mc2.metric("Arquivos processados", total_arq_processados,
+                       delta=f"{total_arq_processados - total_arq_submetidos} descartados" if total_arq_processados < total_arq_submetidos else None,
+                       delta_color="inverse")
+            mc3.metric("Registros de dano", total_danos_processados)
+            st.divider()
+
             if damages_finais:
                 path_col_det = next((c for c in df_details_final.columns if any(x in c.lower() for x in ['path', 'file', 'image'])), None) if df_details_final is not None else None
                 fotos_details = {clean_filename(n) for n in df_details_final[path_col_det].unique() if n} if path_col_det else set()
 
                 for nome_dam, df_dam in damages_finais:
-                    st.markdown(f"**{nome_dam}**")
+                    st.markdown(f"**{nome_dam}** — {len(df_dam)} registro(s)")
                     if 'Photo File Name' in df_dam.columns:
                         fotos_dam = {clean_filename(n) for n in df_dam['Photo File Name'].unique() if n}
                         fotos_sem_match = fotos_dam - fotos_details
                         if fotos_sem_match:
-                            st.error(f"❌ {len(fotos_sem_match)} foto(s) no Damage sem correspondência no Details: {', '.join(sorted(fotos_sem_match))}")
+                            st.error(f"❌ {len(fotos_sem_match)} foto(s) sem correspondência no Details: {', '.join(sorted(fotos_sem_match))}")
                             erros_pos.append(f"Damages ({nome_dam}): {len(fotos_sem_match)} foto(s) sem correspondência no Details")
                         else:
                             st.success("✅ Todas as fotos encontradas no Details")
+
+                # Lista arquivos descartados
+                nomes_processados = {nome for nome, _ in damages_finais}
+                descartados = [f.name for f in f_dam_list if f.name not in nomes_processados]
+                if descartados:
+                    st.warning(f"⚠️ {len(descartados)} arquivo(s) descartado(s) por não ter fotos no Details: {', '.join(descartados)}")
             else:
                 st.info("Nenhum arquivo de Damages gerado.")
 
