@@ -28,6 +28,8 @@ if 'vinculos_confirmados' not in st.session_state:
     st.session_state.vinculos_confirmados = {}
 if 'turbinas_horizon_originais' not in st.session_state:
     st.session_state.turbinas_horizon_originais = []
+if 'turbinas_horizon_removidas' not in st.session_state:
+    st.session_state.turbinas_horizon_removidas = []
 
 # --- FUNÇÕES ---
 
@@ -265,39 +267,53 @@ if h_ok and s_ok and df_atw_dedup is not None:
             f"{', '.join(faltantes)}"
         )
 
-        # Opções disponíveis: turbinas ATW que não foram removidas e não estão já vinculadas
         removidas_set = set(st.session_state.turbinas_removidas)
+        hor_removidas = set(st.session_state.turbinas_horizon_removidas)
         ja_vinculadas = set(vinculos.values())
         opcoes_atw = sorted(set_atw - removidas_set - ja_vinculadas)
 
-        if opcoes_atw:
-            correcoes = {}
-            cv1, cv2 = st.columns(2)
-            for i, th in enumerate(faltantes):
-                with cv1 if i % 2 == 0 else cv2:
-                    # Sugestão automática por similaridade de string
-                    sugerido, score = sugerir_match(th, opcoes_atw)
-                    default_idx = opcoes_atw.index(sugerido) if sugerido in opcoes_atw else 0
-                    label_score = f" ({score:.0%} similar)" if score < 1.0 else " (idêntico)"
-                    sel = st.selectbox(
-                        f"Vincular '{th}' (Horizon) a: — sugestão: **{sugerido}**{label_score}",
-                        options=opcoes_atw,
-                        index=default_idx,
-                        key=f"v_{th}"
-                    )
-                    correcoes[th] = sel
+        # Separa faltantes em: para remover vs para vincular
+        para_remover_hor = st.multiselect(
+            "Turbinas da Horizon **sem inspeção** — selecione as que deseja REMOVER do pacote:",
+            options=faltantes,
+            default=[t for t in faltantes if t in hor_removidas],
+            key="hor_remover"
+        )
 
-            if st.button("CONFIRMAR VÍNCULOS"):
-                # Atualiza task_map: turbina ATW herda dados da turbina Horizon
-                for th, ta in correcoes.items():
-                    if th in st.session_state.task_map:
-                        st.session_state.task_map[ta] = st.session_state.task_map[th]
-                # Salva vínculos confirmados
-                st.session_state.vinculos_confirmados.update(correcoes)
-                st.rerun()
+        para_vincular = [t for t in faltantes if t not in para_remover_hor]
 
-        else:
-            st.error("❌ Não há turbinas disponíveis no ATW para vincular.")
+        if st.button("CONFIRMAR REMOÇÃO DA HORIZON", key="btn_hor_remover"):
+            st.session_state.turbinas_horizon_removidas = para_remover_hor
+            st.rerun()
+
+        hor_removidas = set(st.session_state.turbinas_horizon_removidas)
+        para_vincular = [t for t in faltantes if t not in hor_removidas]
+
+        if para_vincular:
+            if opcoes_atw:
+                correcoes = {}
+                cv1, cv2 = st.columns(2)
+                for i, th in enumerate(para_vincular):
+                    with cv1 if i % 2 == 0 else cv2:
+                        sugerido, score = sugerir_match(th, opcoes_atw)
+                        default_idx = opcoes_atw.index(sugerido) if sugerido in opcoes_atw else 0
+                        label_score = f" ({score:.0%} similar)" if score < 1.0 else " (idêntico)"
+                        sel = st.selectbox(
+                            f"Vincular '{th}' (Horizon) a: — sugestão: **{sugerido}**{label_score}",
+                            options=opcoes_atw,
+                            index=default_idx,
+                            key=f"v_{th}"
+                        )
+                        correcoes[th] = sel
+
+                if st.button("CONFIRMAR VÍNCULOS"):
+                    for th, ta in correcoes.items():
+                        if th in st.session_state.task_map:
+                            st.session_state.task_map[ta] = st.session_state.task_map[th]
+                    st.session_state.vinculos_confirmados.update(correcoes)
+                    st.rerun()
+            else:
+                st.error("❌ Não há turbinas disponíveis no ATW para vincular.")
 
     # Exibe vínculos já confirmados
     if vinculos:
@@ -306,12 +322,19 @@ if h_ok and s_ok and df_atw_dedup is not None:
                 st.markdown(f"- **{th}** (Horizon) → **{ta}** (ATW)")
 
     # --- TUDO OK ---
-    removidas_final = st.session_state.turbinas_removidas
+    removidas_final = set(st.session_state.turbinas_removidas)
+    hor_removidas_final = set(st.session_state.turbinas_horizon_removidas)
     ainda_extras_final = [
         e for e in (set_atw - set_hor - set(vinculos.values()))
         if e not in removidas_final
     ]
-    faltantes_final = sorted(set_hor - set(vinculos.keys()) - set_atw)
+    # Faltantes: exclui as que foram removidas da Horizon e as já vinculadas
+    faltantes_final = sorted(
+        set_hor - set(vinculos.keys()) - set_atw - hor_removidas_final
+    )
+
+    if hor_removidas_final:
+        st.success(f"✅ {len(hor_removidas_final)} turbina(s) da Horizon removida(s) do pacote por ausência de inspeção: {', '.join(sorted(hor_removidas_final))}")
 
     if not faltantes_final and not ainda_extras_final:
         st.success("✅ Dados completos para as turbinas solicitadas pela Horizon.")
@@ -490,8 +513,9 @@ if s_ok and d_ok and m_ok and pode_forjar and not erros_criticos:
             df_atw = df_atw_dedup.copy()  # já deduplicado
             df_summary_final = None
             if df_hor is not None and df_atw is not None:
-                # Summary filtra apenas por nomes Horizon (não ATW), pois df_hor['Turbine'] usa nomenclatura Horizon
-                valid_set_hor = nomes_horizon - removidas_set
+                # Summary filtra apenas por nomes Horizon, excluindo ATW e turbinas Horizon sem inspeção
+                hor_removidas_exp = set(st.session_state.turbinas_horizon_removidas)
+                valid_set_hor = nomes_horizon - removidas_set - hor_removidas_exp
                 df_hor = df_hor[df_hor['Turbine'].isin(valid_set_hor)].copy()
 
                 date_col_atw = next((c for c in df_atw.columns if 'date' in c.lower() or 'data' in c.lower()), None)
