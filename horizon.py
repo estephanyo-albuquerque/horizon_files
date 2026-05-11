@@ -4,6 +4,7 @@ import zipfile
 import io
 import os
 import re
+from difflib import SequenceMatcher
 
 # --- CONFIGURAÇÃO ---
 st.set_page_config(layout="wide", page_title="Processador Horizon")
@@ -93,6 +94,31 @@ def load_horizon_base(uploaded_file):
         st.error(f"Erro ao carregar base Horizon: {e}")
         return None
 
+
+def sugerir_match(nome_horizon, opcoes_atw):
+    """
+    Retorna a turbina ATW mais similar ao nome Horizon.
+    Usa SequenceMatcher para comparar strings normalizadas.
+    """
+    def normalizar(s):
+        # Remove espaços, hifens, zeros à esquerda e lowercase
+        s = s.lower()
+        s = re.sub(r'[-_\s]', '', s)          # remove separadores
+        s = re.sub(r'0+(\d)', r'\1', s)        # remove zeros à esquerda
+        return s
+
+    nome_norm = normalizar(nome_horizon)
+    melhor_score = -1
+    melhor_opcao = opcoes_atw[0] if opcoes_atw else None
+
+    for opcao in opcoes_atw:
+        score = SequenceMatcher(None, nome_norm, normalizar(opcao)).ratio()
+        if score > melhor_score:
+            melhor_score = score
+            melhor_opcao = opcao
+
+    return melhor_opcao, melhor_score
+
 def deduplicate_atw(df):
     """Remove duplicatas do ATW mantendo a primeira ocorrência por Turbine."""
     if df is None or 'Turbine' not in df.columns:
@@ -130,6 +156,11 @@ with c1:
                     .set_index('Turbine')[['Horizon Task ID', 'Site']]
                     .to_dict('index')
                 )
+                # Reaplicar vínculos confirmados após qualquer rerun
+                # Sem isso, as chaves ATW somem do task_map e os damages TAC ficam de fora
+                for th, ta in st.session_state.vinculos_confirmados.items():
+                    if th in st.session_state.task_map:
+                        st.session_state.task_map[ta] = st.session_state.task_map[th]
         except: pass
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -237,10 +268,12 @@ if h_ok and s_ok and df_atw_dedup is not None:
             cv1, cv2 = st.columns(2)
             for i, th in enumerate(faltantes):
                 with cv1 if i % 2 == 0 else cv2:
-                    # Pré-seleciona vínculo existente se já foi confirmado antes
-                    default_idx = 0
+                    # Sugestão automática por similaridade de string
+                    sugerido, score = sugerir_match(th, opcoes_atw)
+                    default_idx = opcoes_atw.index(sugerido) if sugerido in opcoes_atw else 0
+                    label_score = f" ({score:.0%} similar)" if score < 1.0 else " (idêntico)"
                     sel = st.selectbox(
-                        f"Vincular '{th}' (Horizon) a:",
+                        f"Vincular '{th}' (Horizon) a: — sugestão: **{sugerido}**{label_score}",
                         options=opcoes_atw,
                         index=default_idx,
                         key=f"v_{th}"
@@ -339,10 +372,16 @@ if s_ok and d_ok and m_ok and pode_forjar:
         df_chk_d = load_csv_robust(f_det)
         if df_chk_d is not None:
             idc = 'ID' if 'ID' in df_chk_d.columns else df_chk_d.columns[0]
-            valid_set_chk = set(st.session_state.task_map.keys()) - set(st.session_state.turbinas_removidas)
+            # Inclui nomes ATW dos vínculos no valid_set de verificação
+            nomes_atw_chk = set(st.session_state.vinculos_confirmados.values())
+            valid_set_chk = (set(st.session_state.task_map.keys()) | nomes_atw_chk) - set(st.session_state.turbinas_removidas)
             df_chk_d = df_chk_d[df_chk_d[idc].isin(valid_set_chk)]
 
-            path_col = next((c for c in df_chk_d.columns if any(x in c.lower() for x in ['path', 'file', 'image'])), None)
+            # Prioriza 'Path' sobre 'Image URL' para evitar URLs completas no match
+            path_col = next(
+                (c for c in df_chk_d.columns if c.lower() == 'path'),
+                next((c for c in df_chk_d.columns if any(x in c.lower() for x in ['file', 'image']) and 'url' not in c.lower()), None)
+            )
             url_col  = next((c for c in df_chk_d.columns if 'url' in c.lower()), None)
 
             if path_col:
@@ -432,14 +471,21 @@ if s_ok and d_ok and m_ok and pode_forjar and not erros_criticos:
         with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED) as zip_file:
             q = '"'
             removidas_set = set(st.session_state.turbinas_removidas)
-            valid_set = set(st.session_state.task_map.keys()) - removidas_set
+
+            # valid_set construído diretamente: nomes Horizon + nomes ATW dos vínculos
+            # Não depende do task_map ter sido reaplicado corretamente no rerun
+            nomes_horizon = set(st.session_state.task_map.keys())
+            nomes_atw_vinculados = set(st.session_state.vinculos_confirmados.values())
+            valid_set = (nomes_horizon | nomes_atw_vinculados) - removidas_set
 
             # 1. Summary Final
             df_hor = load_horizon_base(f_horizon)
             df_atw = df_atw_dedup.copy()  # já deduplicado
             df_summary_final = None
             if df_hor is not None and df_atw is not None:
-                df_hor = df_hor[df_hor['Turbine'].isin(valid_set)].copy()
+                # Summary filtra apenas por nomes Horizon (não ATW), pois df_hor['Turbine'] usa nomenclatura Horizon
+                valid_set_hor = nomes_horizon - removidas_set
+                df_hor = df_hor[df_hor['Turbine'].isin(valid_set_hor)].copy()
 
                 date_col_atw = next((c for c in df_atw.columns if 'date' in c.lower() or 'data' in c.lower()), None)
                 type_col_atw = next((c for c in df_atw.columns if 'inspection type' in c.lower()), None)
@@ -476,9 +522,26 @@ if s_ok and d_ok and m_ok and pode_forjar and not erros_criticos:
             valid_photos = set()
             if df_d is not None:
                 idc = 'ID' if 'ID' in df_d.columns else df_d.columns[0]
-                df_d = df_d[df_d[idc].isin(valid_set)].copy()
 
-                path_col = next((c for c in df_d.columns if any(x in c.lower() for x in ['path', 'file', 'image'])), df_d.columns[-1])
+                # Inverte vínculos: {nome_atw: nome_horizon}
+                # Permite traduzir IDs ATW do Details para nomes Horizon antes do join
+                atw_para_hor = {v: k for k, v in st.session_state.vinculos_confirmados.items()}
+
+                # Filtra pelo valid_set expandido (nomes Horizon + nomes ATW vinculados)
+                nomes_atw_vinculados = set(st.session_state.vinculos_confirmados.values())
+                valid_set_det = valid_set | nomes_atw_vinculados
+                df_d = df_d[df_d[idc].isin(valid_set_det)].copy()
+
+                # Substitui IDs ATW vinculados pelo nome Horizon correspondente
+                # Ex: TAC-II-01 → TACAICO II - 01, para que o join com task_map funcione
+                df_d[idc] = df_d[idc].map(lambda x: atw_para_hor.get(x, x))
+
+                # Prioriza 'Path' (basename limpo) sobre 'Image URL' (URL completa)
+                path_col = next(
+                    (c for c in df_d.columns if c.lower() == 'path'),
+                    next((c for c in df_d.columns if any(x in c.lower() for x in ['file', 'image']) and 'url' not in c.lower()),
+                    next((c for c in df_d.columns if 'url' in c.lower()), df_d.columns[-1]))
+                )
                 valid_photos = {clean_filename(n) for n in df_d[path_col].unique() if n}
 
                 df_d['Horizon Task ID'] = df_d[idc].map(lambda x: st.session_state.task_map.get(x, {}).get('Horizon Task ID'))
