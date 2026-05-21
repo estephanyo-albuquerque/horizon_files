@@ -120,6 +120,11 @@ def _remap_severity(sky_type, sky_material, sev_str, width_str, subtype=""):
         sev = int(sev_str)
     except (ValueError, TypeError):
         return sev_str, ""
+    # Discoloration Mec.Oil → sempre Sev 2, inclusive quando sev original é 0
+    if sky_type == "Discoloration" and subtype == "Mechanical (Oil)":
+        if sev != 2:
+            return "2", f"Sev convertida Discoloration Mec.Oil: {sev}→2"
+        return sev_str, ""
     if sev == 0:
         return sev_str, ""
     if sky_type == "Bondline Failure":
@@ -129,10 +134,6 @@ def _remap_severity(sky_type, sky_material, sev_str, width_str, subtype=""):
             return sev_str, "ALERTA: largura inválida para Bondline Failure"
         new_sev = 4 if w_cm <= 25 else 5
         return str(new_sev), f"Sev recalculada por largura ({w_cm:.1f}cm): {sev}→{new_sev}"
-    if sky_type == "Discoloration" and subtype == "Mechanical (Oil)":
-        if sev != 2:
-            return "2", f"Sev convertida Discoloration Mec.Oil: {sev}→2"
-        return sev_str, ""
     if sky_type == "Delamination":
         if sev == 2:
             return "3", "Sev convertida Delamination: 2→3"
