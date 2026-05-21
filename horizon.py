@@ -110,11 +110,11 @@ MAPPING = {
 SKYSPECS_COLUMNS = [
     "Photo File Name", "Date", "Component", "Material", "Type", "Subtype",
     "Damage Location", "Blade Side", "Severity", "Width (m)", "Length (m)",
-    "Distance (m)", "Coordinates", "FLAG"
+    "Distance (m)", "Coordinates"
 ]
 
 
-def _remap_severity(sky_type, sky_material, sev_str, width_str):
+def _remap_severity(sky_type, sky_material, sev_str, width_str, subtype=""):
     """Converte severidade Arthwind → SkySpecs. Retorna (nova_sev, nota)."""
     try:
         sev = int(sev_str)
@@ -129,6 +129,10 @@ def _remap_severity(sky_type, sky_material, sev_str, width_str):
             return sev_str, "ALERTA: largura inválida para Bondline Failure"
         new_sev = 4 if w_cm <= 25 else 5
         return str(new_sev), f"Sev recalculada por largura ({w_cm:.1f}cm): {sev}→{new_sev}"
+    if sky_type == "Discoloration" and subtype == "Mechanical (Oil)":
+        if sev != 2:
+            return "2", f"Sev convertida Discoloration Mec.Oil: {sev}→2"
+        return sev_str, ""
     if sky_type == "Delamination":
         if sev == 2:
             return "3", "Sev convertida Delamination: 2→3"
@@ -201,7 +205,7 @@ def convert_damages_df(df, filename):
             flag = (flag + " | " if flag else "") + "ALERTA: Severidade 0 em registro que não é Check Point"
 
         severity_final, sev_nota = _remap_severity(
-            sky_type, material, severity_orig, str(row.get("Width", "0"))
+            sky_type, material, severity_orig, str(row.get("Width", "0")), subtype_out
         )
         if sev_nota:
             flag = (flag + " | " if flag else "") + sev_nota
@@ -231,9 +235,9 @@ def convert_damages_df(df, filename):
             "Length (m)":      str(row.get("Length", "")),
             "Distance (m)":    str(row.get("Distance", "")),
             "Coordinates":     str(row.get("Coordinates", "")),
-            "FLAG":            flag,
         })
 
+    # FLAG não vai para o CSV de saída — apenas para o relatório de alertas
     df_out = pd.DataFrame(output_rows, columns=SKYSPECS_COLUMNS) if output_rows else pd.DataFrame(columns=SKYSPECS_COLUMNS)
     return df_out, flags_report
 
@@ -627,6 +631,61 @@ if s_ok and d_ok and m_ok and pode_forjar:
                         avisos.append(f"Damages ({f_dam.name}): tipo(s) sem mapeamento — {', '.join(tipos_sem_mapa)}")
                     else:
                         st.success("✅ Todos os tipos mapeados para SkySpecs")
+
+    # --------------------------------------------------------------------------
+    # 🔴 Casos Críticos — Severidade 5
+    # --------------------------------------------------------------------------
+    if f_dam_list:
+        with st.expander("🔴 Casos Críticos — Severidade 5", expanded=True):
+            criticos_all = []
+            for f_dam in f_dam_list:
+                f_dam.seek(0)
+                df_raw = load_csv_robust(f_dam, is_damage=True)
+                if df_raw is not None and "Type" in df_raw.columns:
+                    # Exclui checkpoints usando o mesmo critério do convert_damages_df
+                    is_cp = df_raw["Type"].str.strip().str.lower().apply(
+                        lambda t: MAPPING.get(t, {}).get("_is_checkpoint", False)
+                    )
+                    df_real = df_raw[~is_cp].reset_index(drop=True)
+
+                    if not df_real.empty:
+                        f_dam.seek(0)
+                        df_conv, _ = convert_damages_df(df_raw, f_dam.name)
+                        df_conv = df_conv.reset_index(drop=True)
+
+                        sev5_mask = df_conv["Severity"].astype(str) == "5"
+                        if sev5_mask.any():
+                            df5_raw = df_real[sev5_mask].reset_index(drop=True)
+                            df5_conv = df_conv[sev5_mask].reset_index(drop=True)
+                            for i in range(len(df5_conv)):
+                                criticos_all.append({
+                                    "Arquivo": f_dam.name,
+                                    "Photo File Name": df5_conv.at[i, "Photo File Name"],
+                                    "Tipo (Arthwind)": df5_raw.at[i, "Type"],
+                                    "Sev antes": df5_raw.at[i, "Severity"] if "Severity" in df5_raw.columns else "",
+                                    "Component": df5_conv.at[i, "Component"],
+                                    "Material": df5_conv.at[i, "Material"],
+                                    "Type (SkySpecs)": df5_conv.at[i, "Type"],
+                                    "Subtype": df5_conv.at[i, "Subtype"],
+                                    "Sev depois": df5_conv.at[i, "Severity"],
+                                })
+
+            if criticos_all:
+                df_criticos = pd.DataFrame(criticos_all)
+                st.markdown(f"**{len(criticos_all)} registro(s) com Severidade 5 após conversão:**")
+                st.dataframe(
+                    df_criticos,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Arquivo": st.column_config.TextColumn("Arquivo", width="medium"),
+                        "Tipo (Arthwind)": st.column_config.TextColumn("Tipo (Arthwind)", width="medium"),
+                        "Sev antes": st.column_config.TextColumn("Sev antes", width="small"),
+                        "Sev depois": st.column_config.TextColumn("Sev depois", width="small"),
+                    }
+                )
+            else:
+                st.info("Nenhum registro com Severidade 5 nos arquivos carregados.")
 
     st.divider()
     if erros_criticos:
