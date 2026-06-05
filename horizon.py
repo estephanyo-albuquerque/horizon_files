@@ -31,6 +31,26 @@ if 'turbinas_horizon_removidas' not in st.session_state:
 
 
 # ==============================================================================
+# UTILITÁRIO DE DATA
+# ==============================================================================
+
+def parse_date_flexible(val):
+    """Converte datas em qualquer formato (ISO, BR, US) para mm/dd/yyyy."""
+    if pd.isna(val) or str(val).strip() == '':
+        return pd.NaT
+    s = str(val).strip()
+    # ISO: yyyy-mm-dd
+    if re.match(r'^\d{4}-\d{2}-\d{2}$', s):
+        return pd.to_datetime(s, format='%Y-%m-%d', errors='coerce')
+    # BR: dd/mm/yyyy (dia > 12 garante que não é ambíguo)
+    parts = s.split('/')
+    if len(parts) == 3 and parts[0].isdigit() and int(parts[0]) > 12:
+        return pd.to_datetime(s, format='%d/%m/%Y', errors='coerce')
+    # US: mm/dd/yyyy (padrão Horizon)
+    return pd.to_datetime(s, dayfirst=False, errors='coerce')
+
+
+# ==============================================================================
 # MAPEAMENTO ARTHWIND → SKYSPECS
 # ==============================================================================
 
@@ -238,7 +258,6 @@ def convert_damages_df(df, filename):
             "Coordinates":     str(row.get("Coordinates", "")),
         })
 
-    # FLAG não vai para o CSV de saída — apenas para o relatório de alertas
     df_out = pd.DataFrame(output_rows, columns=SKYSPECS_COLUMNS) if output_rows else pd.DataFrame(columns=SKYSPECS_COLUMNS)
     return df_out, flags_report
 
@@ -534,9 +553,12 @@ if s_ok and d_ok and m_ok and pode_forjar:
                 erros_criticos.append("Summary: coluna de data não encontrada")
             else:
                 sample = df_chk_s[date_col].dropna().head(20)
-                formato_br = sample.apply(lambda x: bool(re.match(r'^\d{2}/\d{2}/\d{4}$', str(x))) and int(str(x).split('/')[0]) > 12).any()
-                ambiguo    = sample.apply(lambda x: bool(re.match(r'^\d{2}/\d{2}/\d{4}$', str(x))) and int(str(x).split('/')[0]) <= 12).any()
-                if formato_br:
+                formato_iso = sample.apply(lambda x: bool(re.match(r'^\d{4}-\d{2}-\d{2}$', str(x)))).any()
+                formato_br  = sample.apply(lambda x: bool(re.match(r'^\d{2}/\d{2}/\d{4}$', str(x))) and int(str(x).split('/')[0]) > 12).any()
+                ambiguo     = sample.apply(lambda x: bool(re.match(r'^\d{2}/\d{2}/\d{4}$', str(x))) and int(str(x).split('/')[0]) <= 12).any()
+                if formato_iso:
+                    st.success(f"✅ Formato de data ISO detectado (yyyy-mm-dd) — será convertido para mm/dd/yyyy ({date_col})")
+                elif formato_br:
                     st.warning("⚠️ Datas em formato BR (dd/mm/yyyy) — serão convertidas para mm/dd/yyyy")
                     avisos.append("Summary: datas em formato BR serão convertidas")
                 elif ambiguo:
@@ -643,7 +665,6 @@ if s_ok and d_ok and m_ok and pode_forjar:
                 f_dam.seek(0)
                 df_raw = load_csv_robust(f_dam, is_damage=True)
                 if df_raw is not None and "Type" in df_raw.columns:
-                    # Exclui checkpoints usando o mesmo critério do convert_damages_df
                     is_cp = df_raw["Type"].str.strip().str.lower().apply(
                         lambda t: MAPPING.get(t, {}).get("_is_checkpoint", False)
                     )
@@ -737,9 +758,8 @@ if s_ok and d_ok and m_ok and pode_forjar and not erros_criticos:
                         lambda t: atw_lookup.loc[resolve_atw_name(t), date_col_atw]
                         if resolve_atw_name(t) in atw_lookup.index else ''
                     )
-                    df_hor['Inspection Date'] = pd.to_datetime(
-                        df_hor['Inspection Date'], dayfirst=True, errors='coerce'
-                    ).dt.strftime('%m/%d/%Y')
+                    # CORRIGIDO: parse_date_flexible suporta ISO, BR e US
+                    df_hor['Inspection Date'] = df_hor['Inspection Date'].apply(parse_date_flexible).dt.strftime('%m/%d/%Y')
                 if type_col_atw:
                     df_hor['Inspection Type'] = df_hor['Turbine'].map(
                         lambda t: atw_lookup.loc[resolve_atw_name(t), type_col_atw]
@@ -774,16 +794,13 @@ if s_ok and d_ok and m_ok and pode_forjar and not erros_criticos:
             for f_dam in f_dam_list:
                 df_m = load_csv_robust(f_dam, is_damage=True)
                 if df_m is not None:
-                    # Filtra por fotos que existem no Details
                     df_m = df_m[df_m['Photo File Name'].apply(clean_filename).isin(valid_photos)]
                     if not df_m.empty:
-                        # Aplica conversão Arthwind → SkySpecs
                         df_converted, file_flags = convert_damages_df(df_m, f_dam.name)
                         all_flags.extend(file_flags)
 
                         if not df_converted.empty:
                             damages_finais.append((f_dam.name, df_converted))
-                            # Escreve CSV com colunas SkySpecs
                             csv_lines = [",".join(SKYSPECS_COLUMNS)]
                             for _, row in df_converted.iterrows():
                                 vals = []
@@ -873,7 +890,6 @@ if s_ok and d_ok and m_ok and pode_forjar and not erros_criticos:
                         if fotos_sem_match:
                             st.error(f"❌ {len(fotos_sem_match)} foto(s) sem correspondência no Details")
                             erros_pos.append(f"Damages ({nome_dam}): {len(fotos_sem_match)} foto(s) sem correspondência")
-                    # Verifica se colunas SkySpecs obrigatórias estão presentes
                     for col_req in ["Component", "Material", "Type", "Damage Location"]:
                         if col_req in df_dam.columns:
                             vazios_req = (df_dam[col_req].astype(str).str.strip() == '').sum()
